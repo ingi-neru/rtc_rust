@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 rand = "0.7.3"
 lazy_static = "1.4.0"
+signal-hook = "0.3.4"

@@ -1,6 +1,8 @@
 use lazy_static::lazy_static;
+use signal_hook::flag;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -28,12 +30,39 @@ impl SharedStream {
         }
     }
 }
+impl PartialEq for SharedStream {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare the fields of SharedStream
+        let nickname_1 = self
+            .nickname
+            .lock()
+            .expect("Error when trying to lock nickname");
+        let nickname_2 = other
+            .nickname
+            .lock()
+            .expect("Error when trying to lock nickname");
+
+        nickname_1.clone() == nickname_2.clone()
+    }
+}
+
+fn remove_stream(stream: Arc<SharedStream>) {
+    let mut streams = STREAMS.lock().expect("Error when locking streams");
+
+    let index = streams
+        .iter()
+        .position(|x| Arc::ptr_eq(x, &stream))
+        .unwrap();
+    streams.remove(index);
+}
 
 fn check_if_nickname_exists(nickname: String) -> bool {
     let streams = STREAMS.lock().expect("Failed to lock mutex");
-    println!("streams currently: {}", streams.len());
     for stream in streams.iter() {
-        let stream_nickname = stream.nickname.lock().expect("Error locking nickname");
+        let stream_nickname = stream
+            .nickname
+            .lock()
+            .expect("Error locking nickname mutex");
         if *stream_nickname == nickname {
             return true;
         }
@@ -61,7 +90,6 @@ fn join_client(shared_stream: Arc<SharedStream>) {
             .expect("Failed to read from stream");
         let nickname = String::from_utf8_lossy(&buffer).trim().to_string();
         if !check_if_nickname_exists(nickname.clone()) {
-            println!("im stuck!");
             let stream_clone = Arc::clone(&shared_stream);
             {
                 let mut stream_nickname_lock = shared_stream
@@ -77,7 +105,6 @@ fn join_client(shared_stream: Arc<SharedStream>) {
                 .expect("Failed to write to stream");
             let mut streams = STREAMS.lock().expect("Failed to lock mutex");
             streams.push(shared_stream.clone());
-            println!("stream pushed");
             thread::spawn(move || {
                 handle_client_messages(stream_clone);
             });
@@ -88,46 +115,82 @@ fn join_client(shared_stream: Arc<SharedStream>) {
     }
 }
 
+fn broadcast_message(message: String, current_stream_ptr: *const Mutex<TcpStream>) {
+    let streams = STREAMS.lock().expect("Failed to lock mutex");
+
+    for other_stream in streams.iter() {
+        let other_stream_ptr = Arc::as_ptr(other_stream) as *const Mutex<TcpStream>;
+        if other_stream_ptr != current_stream_ptr {
+            let mut other_write_lock = other_stream
+                .write_stream
+                .lock()
+                .expect("Failed to lock write stream");
+
+            if let Err(e) = other_write_lock.write_all(message.as_bytes()) {
+                eprintln!("Failed to write to stream: {}", e);
+            }
+        }
+    }
+}
+
+fn send_message(message: String, stream: Arc<Mutex<TcpStream>>) {
+    stream
+        .lock()
+        .expect("Failed to lock stream")
+        .write_all(message.as_bytes())
+        .expect("Failed to write to stream");
+}
+
+fn close_server(current_stream_ptr: *const Mutex<TcpStream>) {
+    let message = String::from("SERVER CLOSED");
+    broadcast_message(message, current_stream_ptr);
+    println!("Closing server");
+}
+
 fn handle_client_messages(shared_stream: Arc<SharedStream>) {
     let mut buffer = [0; 1024];
-    let current_stream_ptr = Arc::as_ptr(&shared_stream) as *const Mutex<TcpStream>;
-    loop {
+    let term = Arc::new(AtomicBool::new(false));
+    let stream_as_ptr = Arc::as_ptr(&shared_stream) as *const Mutex<TcpStream>;
+    flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))
+        .expect("Failed to register signal");
+
+    while !term.load(Ordering::Relaxed) {
         let mut stream_lock = shared_stream
             .read_stream
             .lock()
             .expect("Failed to lock stream");
+
         match stream_lock.read(&mut buffer) {
             Ok(bytes_read) => {
-                println!("Bytes read: {}", bytes_read);
-                let mut response = String::from_utf8_lossy(&buffer).trim().to_string();
-                if bytes_read != 0 {
-                    {
-                        let nickname_guard = shared_stream
-                            .nickname
-                            .lock()
-                            .expect("Failed to lock nickname");
-                        let nickname = &*nickname_guard;
-                        response = format!("<{}>: {}", nickname, response);
-                    }
-                    let streams = STREAMS.lock().expect("Failed to lock mutex");
-                    for other_stream in streams.iter() {
-                        let other_stream_ptr = Arc::as_ptr(other_stream) as *const Mutex<TcpStream>;
-                        if other_stream_ptr != current_stream_ptr {
-                            let mut other_write_lock = other_stream
-                                .write_stream
-                                .lock()
-                                .expect("Failed to lock write stream");
-                            other_write_lock
-                                .write_all(response.as_bytes())
-                                .expect("Failed to write to stream");
-                        }
-                    }
-                } else {
-                    println!("Connection closed by the client.");
-                    break;
+                if bytes_read == 0 {
+                    continue;
                 }
-                if response == "exit" {
-                    break;
+
+                let response = String::from_utf8_lossy(&buffer)
+                    .trim()
+                    .replace("\0", "")
+                    .to_string();
+                if response.is_empty() {
+                    continue;
+                }
+
+                let formatted_response = {
+                    let nickname_guard = shared_stream
+                        .nickname
+                        .lock()
+                        .expect("Failed to lock nickname");
+                    format!("<{}>: {}", &*nickname_guard, response)
+                };
+                if response.trim() == "/exit" {
+                    let nickname_guard = shared_stream
+                        .nickname
+                        .lock()
+                        .expect("Failed to lock nickname");
+                    println!("{} left the chat", &*nickname_guard);
+                    send_message(String::from("EXIT"), shared_stream.write_stream.clone());
+                    remove_stream(shared_stream.clone());
+                } else {
+                    broadcast_message(formatted_response, stream_as_ptr);
                 }
             }
             Err(e) => {
@@ -136,6 +199,8 @@ fn handle_client_messages(shared_stream: Arc<SharedStream>) {
             }
         }
     }
+    let empty_ptr = std::ptr::null() as *const Mutex<TcpStream>;
+    close_server(empty_ptr);
 }
 
 fn main() {
