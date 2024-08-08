@@ -1,7 +1,6 @@
 use rand::Rng;
-use std::io::{stdin, Read, Write};
+use std::io::{stdin, stdout, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -65,7 +64,7 @@ fn join_chat(shared_stream: Arc<SharedStream>) {
             stdin()
                 .read_line(&mut current)
                 .expect("Failed to read line");
-            nickname = current.trim().to_string();
+            nickname = current.trim().replace("\0", "").to_string();
 
             if nickname.is_empty() {
                 let random_num = random_number();
@@ -105,40 +104,30 @@ fn join_chat(shared_stream: Arc<SharedStream>) {
 fn exit_chat(shared_stream: Arc<SharedStream>) {
     {
         let shared_read_lock = shared_stream
-            .read_stream
+            .write_stream
             .lock()
             .expect("Failed to lock read stream");
         if let Err(e) = shared_read_lock.shutdown(std::net::Shutdown::Both) {
             eprintln!("Failed to close read stream: {}", e);
         }
     }
-    //Shutdown write stream
-    //{
-    //    let shared_write_lock = shared_stream
-    //        .write_stream
-    //        .lock()
-    //        .expect("Failed to lock write stream");
-    //    if let Err(e) = shared_write_lock.shutdown(std::net::Shutdown::Both) {
-    //        eprintln!("Failed to close write stream: {}", e);
-    //    }
-    //}
 }
 
 fn write_chat(shared_stream: Arc<SharedStream>) {
     // Spawn a new thread for reading chat
     let stream_clone = Arc::clone(&shared_stream);
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_flag_clone = stop_flag.clone();
     thread::spawn(move || {
         read_chat(stream_clone);
-        stop_flag_clone.store(true, Ordering::Relaxed);
     });
 
-    while !stop_flag.load(Ordering::Relaxed) {
+    loop {
         let mut message = String::new();
         stdin()
             .read_line(&mut message)
             .expect("Failed to read line");
+        if message.trim().replace("\0", "") == "/exit" {
+            break;
+        }
         let mut stream_lock = shared_stream
             .write_stream
             .lock()
@@ -148,8 +137,8 @@ fn write_chat(shared_stream: Arc<SharedStream>) {
             break;
         }
     }
-    println!("Closing connection");
     exit_chat(shared_stream.clone());
+    println!("Closing connection");
 }
 
 fn read_chat(shared_stream: Arc<SharedStream>) {
@@ -166,7 +155,6 @@ fn read_chat(shared_stream: Arc<SharedStream>) {
                 .expect("Failed to read from stream");
         }
         if bytes_read == 0 {
-            println!("Connection closed by the server.");
             break;
         }
 
@@ -176,7 +164,8 @@ fn read_chat(shared_stream: Arc<SharedStream>) {
         } else if response.trim() == "SERVER CLOSED" {
             println!("Server closed the connection");
         } else {
-            print!("{}", response);
+            stdout().flush().unwrap();
+            println!("{}", response);
         }
     }
 }
@@ -184,6 +173,5 @@ fn read_chat(shared_stream: Arc<SharedStream>) {
 fn main() {
     let stream = TcpStream::connect("127.0.0.1:44454").expect("Failed to connect to server");
     let shared_stream = Arc::new(SharedStream::new(stream));
-
     join_chat(shared_stream);
 }
