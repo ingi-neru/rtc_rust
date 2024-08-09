@@ -74,15 +74,13 @@ fn find_stream_by_nickname(nickname: String) -> Option<Arc<SharedStream>> {
             .nickname
             .lock()
             .expect("Error locking nickname mutex");
-        println!("{} == {}", *stream_nickname, nickname);
-        if *stream_nickname == nickname.trim() {
+        if *stream_nickname == nickname {
             return Some(Arc::clone(stream));
         }
     }
     None
 }
 fn join_client(shared_stream: Arc<SharedStream>) {
-    let mut buffer = [0; 1024];
     let mut message = "NICK";
     let mut client_read_lock = shared_stream
         .read_stream
@@ -93,7 +91,7 @@ fn join_client(shared_stream: Arc<SharedStream>) {
         .lock()
         .expect("Failed to lock stream");
     loop {
-        buffer = [0; 1024];
+        let mut buffer = [0; 1024];
         client_read_lock
             .write_all(message.as_bytes())
             .expect("Failed to write to stream");
@@ -103,7 +101,7 @@ fn join_client(shared_stream: Arc<SharedStream>) {
         let nickname = String::from_utf8_lossy(&buffer)
             .trim()
             .to_string()
-            .replace("\n", "");
+            .replace("\0", "");
         if !check_if_nickname_exists(nickname.clone()) {
             let stream_clone = Arc::clone(&shared_stream);
             {
@@ -172,11 +170,10 @@ fn list_users() -> String {
 }
 
 fn handle_client_messages(shared_stream: Arc<SharedStream>) {
-    let mut buffer = [0; 1024];
     let stream_as_ptr = Arc::as_ptr(&shared_stream) as *const Mutex<TcpStream>;
 
     loop {
-        buffer = [0; 1024];
+        let mut buffer = [0; 1024];
         let mut stream_lock = shared_stream
             .read_stream
             .lock()
@@ -194,14 +191,15 @@ fn handle_client_messages(shared_stream: Arc<SharedStream>) {
                     break;
                 }
 
-                let response = String::from_utf8_lossy(&buffer)
+                let response = String::from_utf8_lossy(&buffer[..bytes_read])
                     .trim()
                     .replace("\0", "")
                     .to_string();
 
                 if response.starts_with("/") {
                     let mut split_by = response.split(" ");
-                    let command = split_by.next().unwrap();
+                    let command = split_by.next().unwrap().trim();
+                    println!("got command: {}", command);
                     if ["/broadcast", "/dm", "/users", "/exit"].contains(&command) {
                         if command == "/broadcast" {
                             let formatted_response = {
@@ -214,34 +212,51 @@ fn handle_client_messages(shared_stream: Arc<SharedStream>) {
                             };
                             broadcast_message(formatted_response, stream_as_ptr);
                         } else if command == "/dm" {
-                            println!("Got a DM");
-                            let target_nickname = split_by.next().unwrap_or("").trim();
-                            let message = split_by.skip(2).collect::<Vec<&str>>().join(" ");
-                            if let Some(target_stream) =
-                                find_stream_by_nickname(String::from(target_nickname))
+                            let target_nickname =
+                                split_by.next().unwrap_or("").trim().replace("\0", "");
+                            if target_nickname
+                                == shared_stream
+                                    .nickname
+                                    .lock()
+                                    .expect("Locking nickname unsucsessfull")
+                                    .clone()
                             {
-                                let formatted_response = {
-                                    let nickname_guard = shared_stream
-                                        .nickname
-                                        .lock()
-                                        .expect("Failed to lock nickname");
-                                    format!("<dm><{}>: {}", &*nickname_guard, message)
-                                };
+                                println!("You can't send a direct message to yourself.");
                                 send_message(
-                                    formatted_response,
-                                    target_stream.write_stream.clone(),
+                                    "You can't send a direct message to yourself.".to_string(),
+                                    shared_stream.write_stream.clone(),
                                 );
                             } else {
-                                let err_message = format!("User '{}' not found.", target_nickname);
-                                send_message(err_message, shared_stream.write_stream.clone());
+                                let message = split_by.collect::<Vec<&str>>().join(" ");
+                                if let Some(target_stream) =
+                                    find_stream_by_nickname(target_nickname.clone())
+                                {
+                                    let formatted_response = {
+                                        let nickname_guard = shared_stream
+                                            .nickname
+                                            .lock()
+                                            .expect("Failed to lock nickname");
+                                        format!("<dm><{}>: {}", &*nickname_guard, message)
+                                    };
+                                    send_message(
+                                        formatted_response,
+                                        target_stream.write_stream.clone(),
+                                    );
+                                } else {
+                                    let err_message =
+                                        format!("User '{}' not found.", target_nickname);
+                                    send_message(err_message, shared_stream.write_stream.clone());
+                                }
                             }
                         } else if command == "/users" {
+                            println!("Users command");
                             let user_list = list_users();
                             send_message(
                                 format!("Connected users: {}", user_list),
                                 shared_stream.write_stream.clone(),
                             );
                         } else if command == "/exit" {
+                            println!("Exit command ");
                             let nickname_guard = shared_stream
                                 .nickname
                                 .lock()
@@ -249,10 +264,11 @@ fn handle_client_messages(shared_stream: Arc<SharedStream>) {
                             println!("{} left the chat", &*nickname_guard);
                             send_message(String::from("EXIT"), shared_stream.write_stream.clone());
                             remove_stream(shared_stream.clone());
-                        } else {
-                            let shared_write_stream = shared_stream.write_stream.clone();
-                            send_message(String::from("Not a valid command, valid commands are: /broadcast, /dm <user> <message>, /users, /exit"), shared_write_stream);
                         }
+                    } else {
+                        println!("Not a valid command, valid commands are: /broadcast, /dm <user> <message>, /users, /exit");
+                        let shared_write_stream = shared_stream.write_stream.clone();
+                        send_message(String::from("Not a valid command, valid commands are: /broadcast, /dm <user> <message>, /users, /exit"), shared_write_stream);
                     }
                 } else {
                     let formatted_response = {
